@@ -2,4 +2,7 @@ streamlit
 pandas
 numpy
 plotly
-finance-datareader
+yfinance
+requests
+lxml
+beautifulsoup4

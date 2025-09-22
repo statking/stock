@@ -24,7 +24,7 @@ STOCKS = ['코스피','코스닥','바이오','반도체','2차전지','경기�
 
 NAME2TIC = dict(zip(STOCKS, TICKERS))
 
-# --- 유틸 ---
+# --------- 유틸 ---------
 def safe_read(ticker: str, start: str, retry: int = 1, wait: float = 1.0) -> pd.DataFrame:
     for i in range(retry + 1):
         try:
@@ -65,121 +65,136 @@ def load_interval_returns(start_anchor: str,
                           s2: str, e2: str,
                           sel_tickers: tuple[str, ...],
                           sel_names: tuple[str, ...]) -> pd.DataFrame:
-    """
-    각 종목에 대해 구간1(s1~e1), 구간2(s2~e2) 수익률(%) 계산.
-    DataReader는 start_anchor부터 읽어 효율을 확보.
-    """
     rows = []
     for name, tic in zip(sel_names, sel_tickers):
         data = safe_read(tic, start_anchor, retry=1, wait=1.2)
-
         a1 = close_on_or_after(data, s1)
         b1 = close_on_or_before(data, e1)
         a2 = close_on_or_after(data, s2)
         b2 = close_on_or_before(data, e2)
-
         r1 = round((b1 / a1 - 1) * 100, 2) if (a1 not in (None, 0) and b1 not in (None, 0)) else None
         r2 = round((b2 / a2 - 1) * 100, 2) if (a2 not in (None, 0) and b2 not in (None, 0)) else None
         rows.append([name, tic, r1, r2])
 
     col1 = f"Return {s1}→{e1} (%)"
     col2 = f"Return {s2}→{e2} (%)"
-    df = pd.DataFrame(rows, columns=['Stock', 'Ticker', col1, col2])
-    return df
+    return pd.DataFrame(rows, columns=['Stock','Ticker', col1, col2])
 
 def assign_colors(sorted_df: pd.DataFrame, col: str) -> list[str]:
-    # 코스피(‘KS11’) 기준 색상: 코스피 검정, 코스피보다 높으면 빨강, 낮으면 파랑, 비교불가 회색
     kospi_ratio = None
     try:
         kospi_ratio = float(sorted_df.loc[sorted_df['Ticker'] == 'KS11', col].iloc[0])
     except Exception:
         kospi_ratio = None
-
     colors = []
     for t, r in zip(sorted_df['Ticker'], sorted_df[col]):
         if t == 'KS11':
-            colors.append('black')
+            colors.append('black')        # 코스피는 항상 검정
         elif (r is None) or (pd.isna(r)) or (kospi_ratio is None):
-            colors.append('gray')
+            colors.append('gray')         # 비교불가 → 회색
         elif r > kospi_ratio:
-            colors.append('red')
+            colors.append('red')          # 코스피보다 좋음
         else:
-            colors.append('blue')
+            colors.append('blue')         # 코스피보다 나쁨/같음
     return colors
 
 def bar_fig(df_in: pd.DataFrame, col: str, title: str) -> go.Figure:
     if col not in df_in.columns:
-        st.error(f"필요한 컬럼이 없습니다: '{col}'. 페이지를 다시 실행해 주세요.")
+        st.error(f"필요한 컬럼이 없습니다: '{col}'.")
         return go.Figure()
-
     df_plot = df_in[['Stock','Ticker', col]].copy()
     df_plot[col] = pd.to_numeric(df_plot[col], errors='coerce')
-
-    ordered = (
-        df_plot.sort_values(by=col, ascending=True, na_position='first')
-               .reset_index(drop=True)
-    )
+    ordered = df_plot.sort_values(by=col, ascending=True, na_position='first').reset_index(drop=True)
     colors = assign_colors(ordered, col)
     fig = go.Figure([go.Bar(x=ordered['Stock'], y=ordered[col], marker_color=colors)])
     fig.update_layout(title=title, xaxis_title="Stock", yaxis_title="Return (%)",
                       showlegend=False, height=600, bargap=0.2)
     return fig
 
-# ------------------------------------------
-# 1) 첫 화면: 종목 선택 + 구간 날짜 입력(폼)
-# ------------------------------------------
-with st.form("config_form"):
-    st.subheader("분석 설정")
+# -------------------------------
+# 0) 토글 상태 초기화
+# -------------------------------
+if "toggle_states" not in st.session_state:
+    st.session_state.toggle_states = {name: True for name in STOCKS}  # 초기: 전체 선택
 
-    # 종목 선택
-    st.markdown("**분석할 종목을 선택하세요.** (멀티선택)")
-    c_sel1, c_sel2 = st.columns([3,1])
-    default_all = c_sel2.checkbox("전체 선택/해제", value=True)
-    if default_all:
-        default_selection = STOCKS
-    else:
-        default_selection = []
+def set_all(value: bool):
+    for name in STOCKS:
+        st.session_state.toggle_states[name] = value
 
-    selected_names = c_sel1.multiselect(
-        "종목 선택 (토글)",
-        options=STOCKS,
-        default=default_selection
-    )
+# -------------------------------
+# 1) 첫 화면: 토글 버튼 그리드 + 전체 선택/해제
+# -------------------------------
+st.subheader("분석 대상 선택")
 
-    if not selected_names:
-        st.info("최소 1개 이상의 종목을 선택해 주세요.")
-    st.divider()
+r1c1, r1c2, r1c3 = st.columns([1,1,6])
+with r1c1:
+    if st.button("전체 선택", use_container_width=True):
+        set_all(True)
+with r1c2:
+    if st.button("전체 해제", use_container_width=True):
+        set_all(False)
+with r1c3:
+    st.write("")  # 정렬용 빈 공간
 
-    # 날짜 입력 - 구간1, 구간2
-    today = date.today()
-    st.markdown("**구간 1**")
-    g1c1, g1c2 = st.columns(2)
-    g1_start = g1c1.date_input("시작 날짜를 선택하세요. (구간 1 시작)", pd.to_datetime("2024-01-01"))
-    g1_end   = g1c2.date_input("구간 1 끝 날짜", today)
+# 토글 그리드 (X 제거: 멀티셀렉트 미사용)
+N_COLS = 6
+rows = (len(STOCKS) + N_COLS - 1) // N_COLS
+grid_index = 0
+for _ in range(rows):
+    cols = st.columns(N_COLS, gap="small")
+    for c in cols:
+        if grid_index >= len(STOCKS):
+            break
+        name = STOCKS[grid_index]
+        # 체크박스를 토글 버튼처럼 사용 (라벨 최소화)
+        st.session_state.toggle_states[name] = c.checkbox(
+            label=name,
+            value=st.session_state.toggle_states.get(name, False),
+            key=f"tg_{name}"
+        )
+        grid_index += 1
 
-    st.markdown("**구간 2**")
-    g2c1, g2c2 = st.columns(2)
-    g2_start = g2c1.date_input("시작 날짜를 선택하세요. (구간 2 시작)", pd.to_datetime("2024-07-01"))
-    g2_end   = g2c2.date_input("구간 2 끝 날짜", today)
+selected_names = [n for n, v in st.session_state.toggle_states.items() if v]
+if not selected_names:
+    st.info("최소 1개 이상의 종목을 선택해 주세요.")
 
-    submitted = st.form_submit_button("분석하기")
+st.divider()
 
-# 제출 전에는 종료
-if not submitted:
+# -------------------------------
+# 2) 구간 입력 (시작/끝 날짜), 끝 날짜 기본 = 오늘
+# -------------------------------
+st.subheader("기간 설정")
+today = date.today()
+
+g1c1, g1c2 = st.columns(2)
+g2c1, g2c2 = st.columns(2)
+
+g1_start = g1c1.date_input("시작 날짜를 선택하세요. (구간 1 시작)", pd.to_datetime("2024-01-01"))
+g1_end   = g1c2.date_input("구간 1 끝 날짜", today)
+
+g2_start = g2c1.date_input("시작 날짜를 선택하세요. (구간 2 시작)", pd.to_datetime("2024-07-01"))
+g2_end   = g2c2.date_input("구간 2 끝 날짜", today)
+
+# 분석 실행 버튼 (한 줄 중앙 정렬 느낌으로 배치)
+bc1, bc2, bc3 = st.columns([4,2,4])
+with bc2:
+    run = st.button("분석하기", use_container_width=True)
+
+if not run:
     st.stop()
 
-# --- 유효성 검사 ---
+# -------------------------------
+# 3) 유효성 검사 및 데이터 로드
+# -------------------------------
 if not selected_names:
     st.error("분석할 종목을 한 개 이상 선택해 주세요.")
     st.stop()
 
-# 날짜 문자열 변환
 s1 = pd.to_datetime(g1_start).strftime("%Y-%m-%d")
 e1 = pd.to_datetime(g1_end).strftime("%Y-%m-%d")
 s2 = pd.to_datetime(g2_start).strftime("%Y-%m-%d")
 e2 = pd.to_datetime(g2_end).strftime("%Y-%m-%d")
 
-# 시작-끝 순서 체크
 if pd.to_datetime(s1) > pd.to_datetime(e1):
     st.error("구간 1: 시작 날짜가 끝 날짜보다 늦습니다. 다시 선택해 주세요.")
     st.stop()
@@ -187,23 +202,20 @@ if pd.to_datetime(s2) > pd.to_datetime(e2):
     st.error("구간 2: 시작 날짜가 끝 날짜보다 늦습니다. 다시 선택해 주세요.")
     st.stop()
 
-# 선택 종목에 해당하는 티커만
 selected_tickers = tuple(NAME2TIC[n] for n in selected_names)
 
-# 앵커(start_anchor): 두 구간의 가장 이른 시작 날짜보다 30일 앞에서 읽어 여유 확보
 min_start = min(pd.to_datetime(s1), pd.to_datetime(s2))
 start_anchor = (min_start - pd.Timedelta(days=30)).strftime("%Y-%m-%d")
 
-# 데이터 로드
 df = load_interval_returns(
-    start_anchor,
-    s1, e1,
-    s2, e2,
+    start_anchor, s1, e1, s2, e2,
     tuple(selected_tickers),
     tuple(selected_names)
 )
 
-# 출력
+# -------------------------------
+# 4) 출력
+# -------------------------------
 col1_name = f"Return {s1}→{e1} (%)"
 col2_name = f"Return {s2}→{e2} (%)"
 

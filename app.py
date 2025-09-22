@@ -6,7 +6,7 @@ import FinanceDataReader as fdr
 import plotly.graph_objects as go
 from typing import Optional
 import time
-from datetime import date, datetime
+from datetime import date
 
 st.set_page_config(page_title="ETF 비교 대시보드", layout="wide")
 st.title("코스피 대비 수익률 비교 대시보드")
@@ -24,8 +24,27 @@ STOCKS = ['코스피','코스닥','바이오','반도체','2차전지','경기�
 
 NAME2TIC = dict(zip(STOCKS, TICKERS))
 
-# UI에 표시할 선택 항목(코스피 제외)
-VISIBLE_STOCKS = [s for s in STOCKS if s != '코스피']
+# -------------------------------
+# 선택 UI에 노출할 종목(코스피 제외) + 정렬 규칙
+# -------------------------------
+def ui_sort_key(name: str):
+    """가나다 -> 영어 -> 숫자 -> 기타 순 정렬 키"""
+    ch = name[0]
+    # 한글 음절 범위
+    if '가' <= ch <= '힣':
+        group = 0
+    # ASCII 영문 시작
+    elif ch.isascii() and ch.isalpha():
+        group = 1
+    # 숫자 시작
+    elif ch.isdigit():
+        group = 2
+    else:
+        group = 3
+    # 2차 키: 대/소문자 무시해 비교
+    return (group, name.casefold())
+
+VISIBLE_STOCKS = sorted([s for s in STOCKS if s != '코스피'], key=ui_sort_key)
 
 # --------- 유틸 ---------
 def safe_read(ticker: str, start: str, retry: int = 1, wait: float = 1.0) -> pd.DataFrame:
@@ -84,7 +103,7 @@ def load_interval_returns(start_anchor: str,
     col2 = f"Return {s2}→{e2} (%)"
     df = pd.DataFrame(rows, columns=['Stock','Ticker', col1, col2])
 
-    # 안전장치: 티커 중복 방지 (코스피 이중표시 등)
+    # 안전장치: 티커 중복 제거(코스피 이중표시 예방)
     df = df.drop_duplicates(subset='Ticker', keep='first').reset_index(drop=True)
     return df
 
@@ -112,7 +131,7 @@ def bar_fig(df_in: pd.DataFrame, col: str, title: str) -> go.Figure:
         st.error(f"필요한 컬럼이 없습니다: '{col}'.")
         return go.Figure()
 
-    # 수치 변환 + 티커 중복 방지 (이중 막대 예방)
+    # 수치 변환 + 티커 중복 방지
     df_plot = df_in[['Stock','Ticker', col]].copy()
     df_plot[col] = pd.to_numeric(df_plot[col], errors='coerce')
     df_plot = df_plot.drop_duplicates(subset='Ticker', keep='first')
@@ -148,6 +167,7 @@ with r1c2:
     if st.button("전체 해제", use_container_width=True):
         set_all_visible(False)
 
+# 토글 버튼 그리드 (가나다 → 영어 → 숫자 순으로 정렬된 VISIBLE_STOCKS 사용)
 N_COLS = 6
 rows = (len(VISIBLE_STOCKS) + N_COLS - 1) // N_COLS
 grid_index = 0

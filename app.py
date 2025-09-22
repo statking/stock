@@ -6,12 +6,12 @@ import FinanceDataReader as fdr
 import plotly.graph_objects as go
 from typing import Optional
 import time
-from datetime import date
+from datetime import date, datetime
 
 st.set_page_config(page_title="ETF 비교 대시보드", layout="wide")
 st.title("코스피 대비 수익률 비교 대시보드")
 
-# --- 티커 / 라벨 (코스피 포함: 내부 기준으로 사용) ---
+# --- 티커 / 라벨 (코스피는 내부 기준으로 항상 포함) ---
 TICKERS = ['KS11','KQ11','244580','091230','305540','266390','139280','117700','228790',
            '228800','138520','138540','138530','307520','161510','117460','139230','091220',
            '153130','183700','445290','385510','261220','411060','379800','379810','305080',
@@ -24,7 +24,7 @@ STOCKS = ['코스피','코스닥','바이오','반도체','2차전지','경기�
 
 NAME2TIC = dict(zip(STOCKS, TICKERS))
 
-# 선택 UI에 노출할 종목(코스피 제외)
+# UI에 표시할 선택 항목(코스피 제외)
 VISIBLE_STOCKS = [s for s in STOCKS if s != '코스피']
 
 # --------- 유틸 ---------
@@ -68,6 +68,7 @@ def load_interval_returns(start_anchor: str,
                           s2: str, e2: str,
                           sel_tickers: tuple[str, ...],
                           sel_names: tuple[str, ...]) -> pd.DataFrame:
+    """각 종목에 대해 구간1(s1~e1), 구간2(s2~e2) 수익률(%) 계산"""
     rows = []
     for name, tic in zip(sel_names, sel_tickers):
         data = safe_read(tic, start_anchor, retry=1, wait=1.2)
@@ -81,7 +82,11 @@ def load_interval_returns(start_anchor: str,
 
     col1 = f"Return {s1}→{e1} (%)"
     col2 = f"Return {s2}→{e2} (%)"
-    return pd.DataFrame(rows, columns=['Stock','Ticker', col1, col2])
+    df = pd.DataFrame(rows, columns=['Stock','Ticker', col1, col2])
+
+    # 안전장치: 티커 중복 방지 (코스피 이중표시 등)
+    df = df.drop_duplicates(subset='Ticker', keep='first').reset_index(drop=True)
+    return df
 
 def assign_colors(sorted_df: pd.DataFrame, col: str) -> list[str]:
     # 코스피(KS11)를 기준으로 상대 성과 색상 결정
@@ -106,39 +111,42 @@ def bar_fig(df_in: pd.DataFrame, col: str, title: str) -> go.Figure:
     if col not in df_in.columns:
         st.error(f"필요한 컬럼이 없습니다: '{col}'.")
         return go.Figure()
+
+    # 수치 변환 + 티커 중복 방지 (이중 막대 예방)
     df_plot = df_in[['Stock','Ticker', col]].copy()
     df_plot[col] = pd.to_numeric(df_plot[col], errors='coerce')
+    df_plot = df_plot.drop_duplicates(subset='Ticker', keep='first')
+
     ordered = df_plot.sort_values(by=col, ascending=True, na_position='first').reset_index(drop=True)
     colors = assign_colors(ordered, col)
+
     fig = go.Figure([go.Bar(x=ordered['Stock'], y=ordered[col], marker_color=colors)])
     fig.update_layout(title=title, xaxis_title="Stock", yaxis_title="Return (%)",
                       showlegend=False, height=600, bargap=0.2)
     return fig
 
 # -------------------------------
-# 0) 토글 상태 초기화 (코스피 제외한 보이는 종목만 관리)
+# 0) 토글 상태 초기화 (코스피 제외, 디폴트 = 전체 선택)
 # -------------------------------
 if "toggle_states" not in st.session_state:
-    st.session_state.toggle_states = {name: True for name in VISIBLE_STOCKS}  # 초기: 전체 선택
+    st.session_state.toggle_states = {name: True for name in VISIBLE_STOCKS}
 
 def set_all_visible(value: bool):
     for name in VISIBLE_STOCKS:
         st.session_state.toggle_states[name] = value
 
 # -------------------------------
-# 1) 종목 선택: 토글 버튼(코스피 버튼은 숨김)
+# 1) 종목 선택 (코스피는 숨김, 내부적으로 항상 포함)
 # -------------------------------
 st.subheader("분석 대상 선택")
 
-r1c1, r1c2, r1c3 = st.columns([1,1,6])
+r1c1, r1c2, _ = st.columns([1,1,6])
 with r1c1:
     if st.button("전체 선택", use_container_width=True):
         set_all_visible(True)
 with r1c2:
     if st.button("전체 해제", use_container_width=True):
         set_all_visible(False)
-with r1c3:
-    st.write("")
 
 N_COLS = 6
 rows = (len(VISIBLE_STOCKS) + N_COLS - 1) // N_COLS
@@ -151,36 +159,41 @@ for _ in range(rows):
         name = VISIBLE_STOCKS[grid_index]
         st.session_state.toggle_states[name] = c.checkbox(
             label=name,
-            value=st.session_state.toggle_states.get(name, False),
+            value=st.session_state.toggle_states.get(name, True),  # 기본 전체 선택
             key=f"tg_{name}"
         )
         grid_index += 1
 
-# 내부 로직용 선택 목록: 코스피는 항상 포함(버튼은 숨김)
+# 내부 로직용 선택 목록: 코스피는 항상 포함 (UI에는 미표시)
 selected_user_names = [n for n, v in st.session_state.toggle_states.items() if v]
-selected_names = ['코스피'] + selected_user_names
+final_names   = ['코스피'] + selected_user_names
+final_tickers = ['KS11']  + [NAME2TIC[n] for n in selected_user_names]
 
 st.divider()
 
 # -------------------------------
-# 2) 구간 입력: 덩어리(컨테이너)로 묶어 위→아래 배치
+# 2) 구간 입력: 덩어리(컨테이너)로 묶고 위→아래 배치
 # -------------------------------
 st.subheader("기간 설정")
 today = date.today()
+this_year = today.year
+# 디폴트: 구간1 시작 = 작년 1/1, 구간2 시작 = 올해 1/1, 종료는 모두 오늘
+g1_default_start = date(this_year - 1, 1, 1)
+g2_default_start = date(this_year, 1, 1)
 
 col_g1, col_g2 = st.columns(2, vertical_alignment="top")
 
 with col_g1:
     with st.container(border=True):
         st.markdown("**구간 1**")
-        g1_start = st.date_input("시작 날짜를 선택하세요.", pd.to_datetime("2024-01-01"), key="g1_start")
-        g1_end   = st.date_input("끝 날짜", today, key="g1_end")
+        g1_start = st.date_input("시작 날짜를 선택하세요.", g1_default_start, key="g1_start")
+        g1_end   = st.date_input("종료 날짜를 선택하세요.", today, key="g1_end")
 
 with col_g2:
     with st.container(border=True):
         st.markdown("**구간 2**")
-        g2_start = st.date_input("시작 날짜를 선택하세요.", pd.to_datetime("2024-07-01"), key="g2_start")
-        g2_end   = st.date_input("끝 날짜", today, key="g2_end")
+        g2_start = st.date_input("시작 날짜를 선택하세요.", g2_default_start, key="g2_start")
+        g2_end   = st.date_input("종료 날짜를 선택하세요.", today, key="g2_end")
 
 # 실행 버튼 중앙 정렬
 bc1, bc2, bc3 = st.columns([4,2,4])
@@ -193,26 +206,24 @@ if not run:
 # -------------------------------
 # 3) 유효성 검사 및 데이터 로드
 # -------------------------------
-# (사용자 선택이 0개여도 코스피는 내부적으로 포함되므로 에러 중단 없음)
 s1 = pd.to_datetime(g1_start).strftime("%Y-%m-%d")
 e1 = pd.to_datetime(g1_end).strftime("%Y-%m-%d")
 s2 = pd.to_datetime(g2_start).strftime("%Y-%m-%d")
 e2 = pd.to_datetime(g2_end).strftime("%Y-%m-%d")
 
 if pd.to_datetime(s1) > pd.to_datetime(e1):
-    st.error("구간 1: 시작 날짜가 끝 날짜보다 늦습니다.")
+    st.error("구간 1: 시작 날짜가 종료 날짜보다 늦습니다.")
     st.stop()
 if pd.to_datetime(s2) > pd.to_datetime(e2):
-    st.error("구간 2: 시작 날짜가 끝 날짜보다 늦습니다.")
+    st.error("구간 2: 시작 날짜가 종료 날짜보다 늦습니다.")
     st.stop()
 
-selected_tickers = tuple(NAME2TIC[n] for n in selected_names)
-
+# 앵커: 두 구간의 가장 이른 시작일 - 30일
 min_start = min(pd.to_datetime(s1), pd.to_datetime(s2))
 start_anchor = (min_start - pd.Timedelta(days=30)).strftime("%Y-%m-%d")
 
 df = load_interval_returns(start_anchor, s1, e1, s2, e2,
-                           tuple(selected_tickers), tuple(selected_names))
+                           tuple(final_tickers), tuple(final_names))
 
 # -------------------------------
 # 4) 출력
@@ -223,12 +234,18 @@ col2_name = f"Return {s2}→{e2} (%)"
 left, right = st.columns(2)
 with left:
     st.subheader(f"구간 1: {s1} → {e1}")
-    st.plotly_chart(bar_fig(df, col1_name, f"Interval Return: {s1}→{e1}"),
-                    use_container_width=True, key=f"plot_{s1}_{e1}_left")
+    st.plotly_chart(
+        bar_fig(df, col1_name, f"Interval Return: {s1}→{e1}"),
+        use_container_width=True,
+        key=f"plot_{s1}_{e1}_left"
+    )
 with right:
     st.subheader(f"구간 2: {s2} → {e2}")
-    st.plotly_chart(bar_fig(df, col2_name, f"Interval Return: {s2}→{e2}"),
-                    use_container_width=True, key=f"plot_{s2}_{e2}_right")
+    st.plotly_chart(
+        bar_fig(df, col2_name, f"Interval Return: {s2}→{e2}"),
+        use_container_width=True,
+        key=f"plot_{s2}_{e2}_right"
+    )
 
 st.markdown("### 데이터 테이블")
 st.dataframe(df, use_container_width=True)

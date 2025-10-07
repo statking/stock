@@ -81,6 +81,24 @@ def close_on_or_after(df: pd.DataFrame, date_str: str) -> Optional[float]:
         return None
     return float(df.loc[mask, 'Close'].iloc[0])
 
+# ---- 추가: 종료일 휴장일 판별(최소 변경) ----
+@st.cache_data(show_spinner=False, ttl=3600)
+def is_trading_day(date_str: str) -> bool:
+    """
+    KOSPI 지수(KS11)의 거래 캘린더를 이용해 특정 날짜가 개장일인지 확인.
+    date_str: 'YYYY-MM-DD'
+    """
+    d = pd.to_datetime(date_str)
+    # 대상일 전후로 조금 여유를 두고 불러오기(종가 인덱스 존재 확인)
+    start = (d - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+    df_kospi = safe_read('KS11', start, retry=1, wait=1.0)
+    if df_kospi.empty:
+        # 네트워크/공급자 문제 시에는 보수적으로 거래일로 간주하지 않음
+        return False
+    if not isinstance(df_kospi.index, pd.DatetimeIndex):
+        df_kospi.index = pd.to_datetime(df_kospi.index)
+    return pd.to_datetime(date_str) in df_kospi.index
+
 @st.cache_data(show_spinner=True, ttl=3600)
 def load_interval_returns(start_anchor: str,
                           s1: str, e1: str,
@@ -236,6 +254,12 @@ if pd.to_datetime(s1) > pd.to_datetime(e1):
     st.stop()
 if pd.to_datetime(s2) > pd.to_datetime(e2):
     st.error("구간 2: 시작 날짜가 종료 날짜보다 늦습니다.")
+    st.stop()
+
+# ---- 추가: 종료일이 휴장일이면 데이터 수집 중단하고 안내 팝업 ----
+# (디폴트 종료일이 '오늘'인 경우 휴일이면 여기서 걸러짐)
+if not is_trading_day(e1) or not is_trading_day(e2):
+    st.warning("종료일이 휴장일로 지정되어 있습니다. 종료일을 다시 선택하세요.")
     st.stop()
 
 # 앵커: 두 구간의 가장 이른 시작일 - 30일

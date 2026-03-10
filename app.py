@@ -141,10 +141,10 @@ def load_interval_returns(
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_reference_dates(start_anchor: str, s1: str, e1: str, s2: str, e2: str):
     """
-    코스피(KS11)를 기준으로 실제 계산에 사용될 대표 기준일 확인
+    코스피(069500)를 기준으로 실제 계산에 사용될 대표 기준일 확인
     안내 문구용
     """
-    df_kospi = safe_read('KS11', start_anchor, retry=1, wait=1.0)
+    df_kospi = safe_read('069500', start_anchor, retry=1, wait=1.0)
     if df_kospi.empty:
         return None
 
@@ -161,16 +161,16 @@ def get_reference_dates(start_anchor: str, s1: str, e1: str, s2: str, e2: str):
     }
 
 def assign_colors(sorted_df: pd.DataFrame, col: str) -> list[str]:
-    # 코스피(KS11)를 기준으로 상대 성과 색상 결정
+    # 코스피(069500)를 기준으로 상대 성과 색상 결정
     kospi_ratio = None
     try:
-        kospi_ratio = float(sorted_df.loc[sorted_df['Ticker'] == 'KS11', col].iloc[0])
+        kospi_ratio = float(sorted_df.loc[sorted_df['Ticker'] == '069500', col].iloc[0])
     except Exception:
         kospi_ratio = None
 
     colors = []
     for t, r in zip(sorted_df['Ticker'], sorted_df[col]):
-        if t == 'KS11':
+        if t == '069500':
             colors.append('black')   # 코스피는 검정
         elif (r is None) or (pd.isna(r)) or (kospi_ratio is None):
             colors.append('gray')    # 비교 불가
@@ -245,7 +245,7 @@ for _ in range(rows):
 
 selected_user_names = [n for n, v in st.session_state.toggle_states.items() if v]
 final_names = ['코스피'] + selected_user_names
-final_tickers = ['KS11'] + [NAME2TIC[n] for n in selected_user_names]
+final_tickers = ['069500'] + [NAME2TIC[n] for n in selected_user_names]
 
 st.divider()
 

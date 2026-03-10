@@ -1,26 +1,32 @@
 # app.py
 import streamlit as st
 import pandas as pd
-import numpy as np
 import FinanceDataReader as fdr
 import plotly.graph_objects as go
-from typing import Optional
+from typing import Optional, Tuple
 import time
-from datetime import date
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="ETF 비교 대시보드", layout="wide")
 st.title("코스피 대비 수익률 비교 대시보드")
 
 # --- 티커 / 라벨 (코스피는 내부 기준으로 항상 포함) ---
-TICKERS = ['KS11','KQ11','244580','091230','305540','266390','139280','117700','228790',
-           '228800','138520','138540','138530','307520','161510','117460','139230','091220',
-           '153130','183700','445290','385510','261220','411060','379800','379810','305080',
-           '464470','465580','458730','494670','449450','491010', '138910', '005930','000660','005380']
+TICKERS = [
+    'KS11','KQ11','244580','091230','305540','266390','139280','117700','228790',
+    '228800','138520','138540','138530','307520','161510','117460','139230','091220',
+    '153130','183700','445290','385510','261220','411060','379800','379810','305080',
+    '464470','465580','458730','494670','449450','491010', '138910',
+    '005930','000660','005380'
+]
 
-STOCKS = ['코스피','코스닥','바이오','반도체','2차전지','경기소비재','경기방어','건설','화장품',
-          '여행레저','삼성그룹','현대그룹','LG그룹','지주회사','고배당주','화학','중공업','은행',
-          '단기채','채권혼합','로봇','신재생','원유선물','금현물','S&P500','나스닥100','미국채10',
-          '미국채30','빅테크7','미국배당','조선','방산','AI전력', '구리선물', '삼성전자', 'SK하이닉스','현대차']
+STOCKS = [
+    '코스피','코스닥','바이오','반도체','2차전지','경기소비재','경기방어','건설','화장품',
+    '여행레저','삼성그룹','현대그룹','LG그룹','지주회사','고배당주','화학','중공업','은행',
+    '단기채','채권혼합','로봇','신재생','원유선물','금현물','S&P500','나스닥100','미국채10',
+    '미국채30','빅테크7','미국배당','조선','방산','AI전력', '구리선물',
+    '삼성전자', 'SK하이닉스', '현대차'
+]
 
 NAME2TIC = dict(zip(STOCKS, TICKERS))
 
@@ -30,18 +36,14 @@ NAME2TIC = dict(zip(STOCKS, TICKERS))
 def ui_sort_key(name: str):
     """가나다 -> 영어 -> 숫자 -> 기타 순 정렬 키"""
     ch = name[0]
-    # 한글 음절 범위
     if '가' <= ch <= '힣':
         group = 0
-    # ASCII 영문 시작
     elif ch.isascii() and ch.isalpha():
         group = 1
-    # 숫자 시작
     elif ch.isdigit():
         group = 2
     else:
         group = 3
-    # 2차 키: 대/소문자 무시해 비교
     return (group, name.casefold())
 
 VISIBLE_STOCKS = sorted([s for s in STOCKS if s != '코스피'], key=ui_sort_key)
@@ -57,73 +59,106 @@ def safe_read(ticker: str, start: str, retry: int = 1, wait: float = 1.0) -> pd.
             else:
                 return pd.DataFrame()
 
-def close_on_or_before(df: pd.DataFrame, date_str: str) -> Optional[float]:
+def normalize_index(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    if not isinstance(out.index, pd.DatetimeIndex):
+        out.index = pd.to_datetime(out.index)
+    out = out.sort_index()
+    return out
+
+def price_date_on_or_before(df: pd.DataFrame, date_str: str) -> Tuple[Optional[float], Optional[str]]:
+    """date_str 이전(포함) 마지막 거래일의 종가와 실제 기준일 반환"""
     if df.empty or 'Close' not in df.columns:
-        return None
+        return None, None
+    df = normalize_index(df)
     target = pd.to_datetime(date_str)
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index)
-    df = df.sort_index()
     mask = df.index <= target
     if not mask.any():
-        return None
-    return float(df.loc[mask, 'Close'].iloc[-1])
+        return None, None
+    used_date = df.index[mask][-1]
+    price = float(df.loc[used_date, 'Close'])
+    return price, used_date.strftime("%Y-%m-%d")
 
-def close_on_or_after(df: pd.DataFrame, date_str: str) -> Optional[float]:
+def price_date_on_or_after(df: pd.DataFrame, date_str: str) -> Tuple[Optional[float], Optional[str]]:
+    """date_str 이후(포함) 첫 거래일의 종가와 실제 기준일 반환"""
     if df.empty or 'Close' not in df.columns:
-        return None
+        return None, None
+    df = normalize_index(df)
     target = pd.to_datetime(date_str)
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index)
-    df = df.sort_index()
     mask = df.index >= target
     if not mask.any():
-        return None
-    return float(df.loc[mask, 'Close'].iloc[0])
-
-# ---- 추가: 종료일 휴장일 판별(최소 변경) ----
-@st.cache_data(show_spinner=False, ttl=3600)
-def is_trading_day(date_str: str) -> bool:
-    """
-    KOSPI 지수(KS11)의 거래 캘린더를 이용해 특정 날짜가 개장일인지 확인.
-    date_str: 'YYYY-MM-DD'
-    """
-    d = pd.to_datetime(date_str)
-    # 대상일 전후로 조금 여유를 두고 불러오기(종가 인덱스 존재 확인)
-    start = (d - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
-    df_kospi = safe_read('KS11', start, retry=1, wait=1.0)
-    if df_kospi.empty:
-        # 네트워크/공급자 문제 시에는 보수적으로 거래일로 간주하지 않음
-        return False
-    if not isinstance(df_kospi.index, pd.DatetimeIndex):
-        df_kospi.index = pd.to_datetime(df_kospi.index)
-    return pd.to_datetime(date_str) in df_kospi.index
+        return None, None
+    used_date = df.index[mask][0]
+    price = float(df.loc[used_date, 'Close'])
+    return price, used_date.strftime("%Y-%m-%d")
 
 @st.cache_data(show_spinner=True, ttl=3600)
-def load_interval_returns(start_anchor: str,
-                          s1: str, e1: str,
-                          s2: str, e2: str,
-                          sel_tickers: tuple[str, ...],
-                          sel_names: tuple[str, ...]) -> pd.DataFrame:
+def load_interval_returns(
+    start_anchor: str,
+    s1: str, e1: str,
+    s2: str, e2: str,
+    sel_tickers: Tuple[str, ...],
+    sel_names: Tuple[str, ...]
+) -> pd.DataFrame:
     """각 종목에 대해 구간1(s1~e1), 구간2(s2~e2) 수익률(%) 계산"""
     rows = []
+
     for name, tic in zip(sel_names, sel_tickers):
         data = safe_read(tic, start_anchor, retry=1, wait=1.2)
-        a1 = close_on_or_after(data, s1)
-        b1 = close_on_or_before(data, e1)
-        a2 = close_on_or_after(data, s2)
-        b2 = close_on_or_before(data, e2)
+
+        a1, a1_date = price_date_on_or_after(data, s1)
+        b1, b1_date = price_date_on_or_before(data, e1)
+        a2, a2_date = price_date_on_or_after(data, s2)
+        b2, b2_date = price_date_on_or_before(data, e2)
+
         r1 = round((b1 / a1 - 1) * 100, 2) if (a1 not in (None, 0) and b1 not in (None, 0)) else None
         r2 = round((b2 / a2 - 1) * 100, 2) if (a2 not in (None, 0) and b2 not in (None, 0)) else None
-        rows.append([name, tic, r1, r2])
+
+        rows.append([
+            name, tic,
+            a1_date, b1_date, r1,
+            a2_date, b2_date, r2
+        ])
 
     col1 = f"Return {s1}→{e1} (%)"
     col2 = f"Return {s2}→{e2} (%)"
-    df = pd.DataFrame(rows, columns=['Stock','Ticker', col1, col2])
+
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            'Stock', 'Ticker',
+            f'구간1 시작 기준일', f'구간1 종료 기준일', col1,
+            f'구간2 시작 기준일', f'구간2 종료 기준일', col2
+        ]
+    )
 
     # 안전장치: 티커 중복 제거(코스피 이중표시 예방)
     df = df.drop_duplicates(subset='Ticker', keep='first').reset_index(drop=True)
     return df
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def get_reference_dates(start_anchor: str, s1: str, e1: str, s2: str, e2: str):
+    """
+    코스피(KS11)를 기준으로 실제 계산에 사용될 대표 기준일 확인
+    안내 문구용
+    """
+    df_kospi = safe_read('KS11', start_anchor, retry=1, wait=1.0)
+    if df_kospi.empty:
+        return None
+
+    _, s1_used = price_date_on_or_after(df_kospi, s1)
+    _, e1_used = price_date_on_or_before(df_kospi, e1)
+    _, s2_used = price_date_on_or_after(df_kospi, s2)
+    _, e2_used = price_date_on_or_before(df_kospi, e2)
+
+    return {
+        "s1_used": s1_used,
+        "e1_used": e1_used,
+        "s2_used": s2_used,
+        "e2_used": e2_used,
+    }
 
 def assign_colors(sorted_df: pd.DataFrame, col: str) -> list[str]:
     # 코스피(KS11)를 기준으로 상대 성과 색상 결정
@@ -132,16 +167,17 @@ def assign_colors(sorted_df: pd.DataFrame, col: str) -> list[str]:
         kospi_ratio = float(sorted_df.loc[sorted_df['Ticker'] == 'KS11', col].iloc[0])
     except Exception:
         kospi_ratio = None
+
     colors = []
     for t, r in zip(sorted_df['Ticker'], sorted_df[col]):
         if t == 'KS11':
-            colors.append('black')        # 코스피는 검정
+            colors.append('black')   # 코스피는 검정
         elif (r is None) or (pd.isna(r)) or (kospi_ratio is None):
-            colors.append('gray')         # 비교 불가
+            colors.append('gray')    # 비교 불가
         elif r > kospi_ratio:
-            colors.append('red')          # 코스피보다 좋음
+            colors.append('red')     # 코스피보다 좋음
         else:
-            colors.append('blue')         # 코스피보다 나쁨/같음
+            colors.append('blue')    # 코스피보다 나쁨/같음
     return colors
 
 def bar_fig(df_in: pd.DataFrame, col: str, title: str) -> go.Figure:
@@ -149,8 +185,7 @@ def bar_fig(df_in: pd.DataFrame, col: str, title: str) -> go.Figure:
         st.error(f"필요한 컬럼이 없습니다: '{col}'.")
         return go.Figure()
 
-    # 수치 변환 + 티커 중복 방지
-    df_plot = df_in[['Stock','Ticker', col]].copy()
+    df_plot = df_in[['Stock', 'Ticker', col]].copy()
     df_plot[col] = pd.to_numeric(df_plot[col], errors='coerce')
     df_plot = df_plot.drop_duplicates(subset='Ticker', keep='first')
 
@@ -158,8 +193,14 @@ def bar_fig(df_in: pd.DataFrame, col: str, title: str) -> go.Figure:
     colors = assign_colors(ordered, col)
 
     fig = go.Figure([go.Bar(x=ordered['Stock'], y=ordered[col], marker_color=colors)])
-    fig.update_layout(title=title, xaxis_title="Stock", yaxis_title="Return (%)",
-                      showlegend=False, height=600, bargap=0.2)
+    fig.update_layout(
+        title=title,
+        xaxis_title="Stock",
+        yaxis_title="Return (%)",
+        showlegend=False,
+        height=600,
+        bargap=0.2
+    )
     return fig
 
 # -------------------------------
@@ -177,7 +218,7 @@ def set_all_visible(value: bool):
 # -------------------------------
 st.subheader("분석 대상 선택")
 
-r1c1, r1c2, _ = st.columns([1,1,6])
+r1c1, r1c2, _ = st.columns([1, 1, 6])
 with r1c1:
     if st.button("전체 선택", use_container_width=True):
         set_all_visible(True)
@@ -185,10 +226,10 @@ with r1c2:
     if st.button("전체 해제", use_container_width=True):
         set_all_visible(False)
 
-# 토글 버튼 그리드 (가나다 → 영어 → 숫자 순으로 정렬된 VISIBLE_STOCKS 사용)
 N_COLS = 6
 rows = (len(VISIBLE_STOCKS) + N_COLS - 1) // N_COLS
 grid_index = 0
+
 for _ in range(rows):
     cols = st.columns(N_COLS, gap="small")
     for c in cols:
@@ -197,27 +238,29 @@ for _ in range(rows):
         name = VISIBLE_STOCKS[grid_index]
         st.session_state.toggle_states[name] = c.checkbox(
             label=name,
-            value=st.session_state.toggle_states.get(name, True),  # 기본 전체 선택
+            value=st.session_state.toggle_states.get(name, True),
             key=f"tg_{name}"
         )
         grid_index += 1
 
-# 내부 로직용 선택 목록: 코스피는 항상 포함 (UI에는 미표시)
 selected_user_names = [n for n, v in st.session_state.toggle_states.items() if v]
-final_names   = ['코스피'] + selected_user_names
-final_tickers = ['KS11']  + [NAME2TIC[n] for n in selected_user_names]
+final_names = ['코스피'] + selected_user_names
+final_tickers = ['KS11'] + [NAME2TIC[n] for n in selected_user_names]
 
 st.divider()
 
 # -------------------------------
-# 2) 구간 입력: 덩어리(컨테이너)로 묶고 위→아래 배치
+# 2) 구간 입력
 # -------------------------------
 st.subheader("기간 설정")
-today = date.today()
+
+# 한국 시간 기준 오늘
+today = datetime.now(ZoneInfo("Asia/Seoul")).date()
 this_year = today.year
+
 # 디폴트: 구간1 시작 = 작년 1/1, 구간2 시작 = 올해 1/1, 종료는 모두 오늘
-g1_default_start = date(this_year - 1, 1, 1)
-g2_default_start = date(this_year, 1, 1)
+g1_default_start = datetime(this_year - 1, 1, 1).date()
+g2_default_start = datetime(this_year, 1, 1).date()
 
 col_g1, col_g2 = st.columns(2, vertical_alignment="top")
 
@@ -225,16 +268,15 @@ with col_g1:
     with st.container(border=True):
         st.markdown("**구간 1**")
         g1_start = st.date_input("시작 날짜를 선택하세요.", g1_default_start, key="g1_start")
-        g1_end   = st.date_input("종료 날짜를 선택하세요.", today, key="g1_end")
+        g1_end = st.date_input("종료 날짜를 선택하세요.", today, key="g1_end")
 
 with col_g2:
     with st.container(border=True):
         st.markdown("**구간 2**")
         g2_start = st.date_input("시작 날짜를 선택하세요.", g2_default_start, key="g2_start")
-        g2_end   = st.date_input("종료 날짜를 선택하세요.", today, key="g2_end")
+        g2_end = st.date_input("종료 날짜를 선택하세요.", today, key="g2_end")
 
-# 실행 버튼 중앙 정렬
-bc1, bc2, bc3 = st.columns([4,2,4])
+bc1, bc2, bc3 = st.columns([4, 2, 4])
 with bc2:
     run = st.button("분석하기", use_container_width=True)
 
@@ -252,30 +294,60 @@ e2 = pd.to_datetime(g2_end).strftime("%Y-%m-%d")
 if pd.to_datetime(s1) > pd.to_datetime(e1):
     st.error("구간 1: 시작 날짜가 종료 날짜보다 늦습니다.")
     st.stop()
+
 if pd.to_datetime(s2) > pd.to_datetime(e2):
     st.error("구간 2: 시작 날짜가 종료 날짜보다 늦습니다.")
     st.stop()
 
-# ---- 추가: 종료일이 휴장일이면 데이터 수집 중단하고 안내 팝업 ----
-# (디폴트 종료일이 '오늘'인 경우 휴일이면 여기서 걸러짐)
-if not is_trading_day(e1) or not is_trading_day(e2):
-    st.warning("종료일이 휴장일로 지정되어 있습니다. 종료일을 다시 선택하세요.")
+# 앵커: 두 구간의 가장 이른 시작일 - 40일
+min_start = min(pd.to_datetime(s1), pd.to_datetime(s2))
+start_anchor = (min_start - pd.Timedelta(days=40)).strftime("%Y-%m-%d")
+
+# 대표 기준일 안내용 (차단 X, 안내만)
+ref_dates = get_reference_dates(start_anchor, s1, e1, s2, e2)
+
+st.caption(
+    "입력한 날짜의 종가가 없으면 자동으로 가장 가까운 거래일 종가를 사용합니다. "
+    "시작일은 해당 날짜 이후 첫 거래일, 종료일은 해당 날짜 이전 마지막 거래일 기준입니다."
+)
+
+if ref_dates is not None:
+    info_msgs = []
+
+    if ref_dates["s1_used"] is not None and ref_dates["s1_used"] != s1:
+        info_msgs.append(f"구간 1 시작일 {s1} → 실제 적용일 {ref_dates['s1_used']}")
+    if ref_dates["e1_used"] is not None and ref_dates["e1_used"] != e1:
+        info_msgs.append(f"구간 1 종료일 {e1} → 실제 적용일 {ref_dates['e1_used']}")
+    if ref_dates["s2_used"] is not None and ref_dates["s2_used"] != s2:
+        info_msgs.append(f"구간 2 시작일 {s2} → 실제 적용일 {ref_dates['s2_used']}")
+    if ref_dates["e2_used"] is not None and ref_dates["e2_used"] != e2:
+        info_msgs.append(f"구간 2 종료일 {e2} → 실제 적용일 {ref_dates['e2_used']}")
+
+    if info_msgs:
+        st.info(" / ".join(info_msgs))
+
+df = load_interval_returns(
+    start_anchor, s1, e1, s2, e2,
+    tuple(final_tickers), tuple(final_names)
+)
+
+if df.empty:
+    st.error("데이터를 불러오지 못했습니다. 잠시 후 다시 시도하세요.")
     st.stop()
 
-# 앵커: 두 구간의 가장 이른 시작일 - 30일
-min_start = min(pd.to_datetime(s1), pd.to_datetime(s2))
-start_anchor = (min_start - pd.Timedelta(days=30)).strftime("%Y-%m-%d")
+# 전부 결측이면 공급자 문제 가능성 안내
+col1_name = f"Return {s1}→{e1} (%)"
+col2_name = f"Return {s2}→{e2} (%)"
 
-df = load_interval_returns(start_anchor, s1, e1, s2, e2,
-                           tuple(final_tickers), tuple(final_names))
+if df[col1_name].isna().all() and df[col2_name].isna().all():
+    st.error("수익률을 계산할 수 있는 데이터가 없습니다. 데이터 제공 상태를 확인한 뒤 다시 시도하세요.")
+    st.stop()
 
 # -------------------------------
 # 4) 출력
 # -------------------------------
-col1_name = f"Return {s1}→{e1} (%)"
-col2_name = f"Return {s2}→{e2} (%)"
-
 left, right = st.columns(2)
+
 with left:
     st.subheader(f"구간 1: {s1} → {e1}")
     st.plotly_chart(
@@ -283,6 +355,7 @@ with left:
         use_container_width=True,
         key=f"plot_{s1}_{e1}_left"
     )
+
 with right:
     st.subheader(f"구간 2: {s2} → {e2}")
     st.plotly_chart(
